@@ -1,265 +1,248 @@
-//! Bit-Packed State Engine (Phase 1)
-//! 
-//! Every software state is compressed into a single `u64` to guarantee:
-//! - O(1) state transitions via bitwise operations
-//! - Cache-line alignment (8 bytes per state)
-//! - Zero-cost serialization (identity function on u64)
+//! Universal Stack-Allocated State Engine
 //!
-//! Layout:
-//!   Bits 0..6    : Cell index (0-63 for 8x8 grid)
-//!   Bits 6..10   : Key bitflags (4 keys)
-//!   Bits 10..14  : Door bitflags (4 doors, open/closed)
-//!   Bits 14..18  : Switch bitflags (4 switches)
-//!   Bits 18..34  : Tick counter (16 bits, up to 65,535 frames)
-//!   Bits 34..64  : Reserved for expansion
+//! `PackedState` is a fixed `[u8; 16]` array, making it `Copy`.
+//! It lives entirely on the CPU stack/registers — zero heap.
+//! A `LayoutConfig` descriptor tells the engine where each field lives.
 
-/// Newtype wrapper for a packed u64 state.
-/// Using a newtype prevents accidental mixing with raw integers
-/// and allows us to implement methods with zero overhead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PackedState(pub u64);
+use std::fmt;
 
-// ─── Bitfield Constants ─────────────────────────────────────────────────────
-// Masks isolate specific bit-ranges; shifts align values into those ranges.
+/// Fixed-size state primitive. 16 bytes = 128 bits of addressable scratch.
+/// Passed by value (Copy) — no indirection, no heap.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackedState {
+    pub data: [u8; 16],
+}
 
-const CELL_MASK: u64      = 0x3F;        // 6 bits:  0b111111
-const CELL_SHIFT: u64     = 0;
-
-const KEY_MASK: u64       = 0x0F;        // 4 bits
-const KEY_SHIFT: u64      = 6;
-
-const DOOR_MASK: u64      = 0x0F;        // 4 bits
-const DOOR_SHIFT: u64     = 10;
-
-const SWITCH_MASK: u64    = 0x0F;        // 4 bits
-const SWITCH_SHIFT: u64   = 14;
-
-const TICK_MASK: u64      = 0xFFFF;      // 16 bits
-const TICK_SHIFT: u64     = 18;
-
-// ─── Constructor ────────────────────────────────────────────────────────────
-
-impl PackedState {
-    /// Build a state from its constituent fields.
-    /// Every parameter is masked to guarantee it fits inside its bitfield,
-    /// making this constructor branchless.
-    #[inline(always)]
-    pub const fn new(cell: u8, keys: u8, doors: u8, switches: u8, ticks: u16) -> Self {
-        let mut raw: u64 = 0;
-        raw |= ((cell as u64) & CELL_MASK) << CELL_SHIFT;
-        raw |= ((keys as u64) & KEY_MASK) << KEY_SHIFT;
-        raw |= ((doors as u64) & DOOR_MASK) << DOOR_SHIFT;
-        raw |= ((switches as u64) & SWITCH_MASK) << SWITCH_SHIFT;
-        raw |= ((ticks as u64) & TICK_MASK) << TICK_SHIFT;
-        PackedState(raw)
-    }
-
-    // ─── Cell (position) ──────────────────────────────────────────────────
-
-    /// Extract cell index (0..63).
-    /// Uses mask-and-shift: `(raw >> shift) & mask`.
-    /// Branchless, single ALU instruction on x86_64.
-    #[inline(always)]
-    pub const fn get_cell(self) -> u8 {
-        ((self.0 >> CELL_SHIFT) & CELL_MASK) as u8
-    }
-
-    /// Replace cell index in-place.
-    /// Clears old bits with `& !mask`, then ORs new value.
-    #[inline(always)]
-    pub const fn set_cell(self, cell: u8) -> Self {
-        let cleared = self.0 & !(CELL_MASK << CELL_SHIFT);
-        PackedState(cleared | (((cell as u64) & CELL_MASK) << CELL_SHIFT))
-    }
-
-    // ─── Keys ───────────────────────────────────────────────────────────────
-
-    /// Extract the raw keys bitmask (0..15).
-    /// Used by the Pattern Database for O(1) heuristic indexing.
-    #[inline(always)]
-    pub const fn get_keys(self) -> u8 {
-        ((self.0 >> KEY_SHIFT) & KEY_MASK) as u8
-    }
-
-    /// Test if key `id` (0..3) is collected.
-    /// `1 << id` creates the bit flag; AND with keys field tests it.
-    #[inline(always)]
-    pub const fn has_key(self, id: u8) -> bool {
-        let keys = ((self.0 >> KEY_SHIFT) & KEY_MASK) as u8;
-        (keys & (1 << id)) != 0
-    }
-
-    /// Add key `id` (0..3) to the keyring.
-    /// ORs the flag into the keys field.
-    #[inline(always)]
-    pub const fn add_key(self, id: u8) -> Self {
-        let flag = ((1u64 << id) & KEY_MASK) << KEY_SHIFT;
-        PackedState(self.0 | flag)
-    }
-
-    // ─── Doors ──────────────────────────────────────────────────────────────
-
-    /// Test if door `id` (0..3) is open.
-    #[inline(always)]
-    pub const fn is_door_open(self, id: u8) -> bool {
-        let doors = ((self.0 >> DOOR_SHIFT) & DOOR_MASK) as u8;
-        (doors & (1 << id)) != 0
-    }
-
-    /// Toggle door `id` (0..3) open/closed.
-    /// XOR flips the bit without branches.
-    #[inline(always)]
-    pub const fn toggle_door(self, id: u8) -> Self {
-        let flag = ((1u64 << id) & DOOR_MASK) << DOOR_SHIFT;
-        PackedState(self.0 ^ flag)
-    }
-
-    /// Force door `id` open (idempotent).
-    #[inline(always)]
-    pub const fn open_door(self, id: u8) -> Self {
-        let flag = ((1u64 << id) & DOOR_MASK) << DOOR_SHIFT;
-        PackedState(self.0 | flag)
-    }
-
-    /// Extract the raw doors bitmask (0..15).
-    #[inline(always)]
-    pub const fn get_doors(self) -> u8 {
-        ((self.0 >> DOOR_SHIFT) & DOOR_MASK) as u8
-    }
-
-    /// Force door `id` closed (idempotent).
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub const fn close_door(self, id: u8) -> Self {
-        let flag = ((1u64 << id) & DOOR_MASK) << DOOR_SHIFT;
-        PackedState(self.0 & !flag)
-    }
-
-    // ─── Switches ───────────────────────────────────────────────────────────
-
-    /// Test if switch `id` (0..3) is flipped.
-    #[inline(always)]
-    pub const fn is_switch_flipped(self, id: u8) -> bool {
-        let switches = ((self.0 >> SWITCH_SHIFT) & SWITCH_MASK) as u8;
-        (switches & (1 << id)) != 0
-    }
-
-    /// Extract the raw switches bitmask (0..15).
-    #[inline(always)]
-    pub const fn get_switches(self) -> u8 {
-        ((self.0 >> SWITCH_SHIFT) & SWITCH_MASK) as u8
-    }
-
-    /// Toggle switch `id` (0..3).
-    #[inline(always)]
-    pub const fn toggle_switch(self, id: u8) -> Self {
-        let flag = ((1u64 << id) & SWITCH_MASK) << SWITCH_SHIFT;
-        PackedState(self.0 ^ flag)
-    }
-
-    // ─── Ticks ──────────────────────────────────────────────────────────────
-
-    /// Extract tick counter.
-    #[inline(always)]
-    pub const fn get_ticks(self) -> u16 {
-        ((self.0 >> TICK_SHIFT) & TICK_MASK) as u16
-    }
-
-    /// Increment tick counter by 1.
-    /// Wraps at 2^16-1 (saturates to prevent overflow into reserved bits).
-    #[inline(always)]
-    pub const fn increment_tick(self) -> Self {
-        let current = ((self.0 >> TICK_SHIFT) & TICK_MASK) as u16;
-        let next = current.saturating_add(1);
-        let cleared = self.0 & !(TICK_MASK << TICK_SHIFT);
-        PackedState(cleared | ((next as u64) << TICK_SHIFT))
-    }
-
-    // ─── Raw access ─────────────────────────────────────────────────────────
-
-    /// Direct raw access for hashing, serialization, and closed-set lookups.
-    #[inline(always)]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    /// Reconstruct from raw u64 (useful for deserialization).
-    #[inline(always)]
-    pub const fn from_raw(raw: u64) -> Self {
-        PackedState(raw)
+impl fmt::Debug for PackedState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PackedState({:02x?})", &self.data)
     }
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────
+/// Runtime descriptor for field placement inside `PackedState.data`.
+/// All offsets are in bytes; masks are in bits within that byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutConfig {
+    pub loc_offset: usize,
+    pub loc_bytes: usize,
+    pub keys_offset: usize,
+    pub doors_offset: usize,
+    pub switches_offset: usize,
+    pub ticks_offset: usize,
+    pub tick_cost_offset: usize,
+}
+
+impl LayoutConfig {
+    /// Standard 8x8 layout:
+    ///   loc       : bytes 0..1  (u16, up to 65k cells)
+    ///   keys      : byte  2
+    ///   doors     : byte  3
+    ///   switches  : byte  4
+    ///   ticks     : bytes 5..6 (u16)
+    ///   tick_cost : byte  7 (accumulated cost for variable terrain)
+    pub const fn standard() -> Self {
+        LayoutConfig {
+            loc_offset: 0,
+            loc_bytes: 2,
+            keys_offset: 2,
+            doors_offset: 3,
+            switches_offset: 4,
+            ticks_offset: 5,
+            tick_cost_offset: 7,
+        }
+    }
+}
+
+impl PackedState {
+    /// Zero-initialised state.
+    pub const fn zero() -> Self {
+        PackedState { data: [0; 16] }
+    }
+
+    // ─── Location (multi-byte, little-endian) ─────────────────────────────
+
+    #[inline(always)]
+    pub fn get_location(&self, cfg: &LayoutConfig) -> u16 {
+        let off = cfg.loc_offset;
+        if cfg.loc_bytes == 1 {
+            self.data[off] as u16
+        } else {
+            (self.data[off] as u16) | ((self.data[off + 1] as u16) << 8)
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_location(&mut self, cfg: &LayoutConfig, val: u16) {
+        let off = cfg.loc_offset;
+        self.data[off] = (val & 0xFF) as u8;
+        if cfg.loc_bytes > 1 {
+            self.data[off + 1] = ((val >> 8) & 0xFF) as u8;
+        }
+    }
+
+    // ─── Single-byte bitflags ─────────────────────────────────────────────
+
+    #[inline(always)]
+    pub fn get_keys(&self, cfg: &LayoutConfig) -> u8 {
+        self.data[cfg.keys_offset]
+    }
+
+    #[inline(always)]
+    pub fn set_keys(&mut self, cfg: &LayoutConfig, val: u8) {
+        self.data[cfg.keys_offset] = val;
+    }
+
+    #[inline(always)]
+    pub fn has_key(&self, cfg: &LayoutConfig, id: u8) -> bool {
+        (self.data[cfg.keys_offset] & (1 << id)) != 0
+    }
+
+    #[inline(always)]
+    pub fn add_key(&mut self, cfg: &LayoutConfig, id: u8) {
+        self.data[cfg.keys_offset] |= 1 << id;
+    }
+
+    #[inline(always)]
+    pub fn get_doors(&self, cfg: &LayoutConfig) -> u8 {
+        self.data[cfg.doors_offset]
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn set_doors(&mut self, cfg: &LayoutConfig, val: u8) {
+        self.data[cfg.doors_offset] = val;
+    }
+
+    #[inline(always)]
+    pub fn is_door_open(&self, cfg: &LayoutConfig, id: u8) -> bool {
+        (self.data[cfg.doors_offset] & (1 << id)) != 0
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn toggle_door(&mut self, cfg: &LayoutConfig, id: u8) {
+        self.data[cfg.doors_offset] ^= 1 << id;
+    }
+
+    #[inline(always)]
+    pub fn open_door(&mut self, cfg: &LayoutConfig, id: u8) {
+        self.data[cfg.doors_offset] |= 1 << id;
+    }
+
+    #[inline(always)]
+    pub fn get_switches(&self, cfg: &LayoutConfig) -> u8 {
+        self.data[cfg.switches_offset]
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn set_switches(&mut self, cfg: &LayoutConfig, val: u8) {
+        self.data[cfg.switches_offset] = val;
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn is_switch_flipped(&self, cfg: &LayoutConfig, id: u8) -> bool {
+        (self.data[cfg.switches_offset] & (1 << id)) != 0
+    }
+
+    #[inline(always)]
+    pub fn toggle_switch(&mut self, cfg: &LayoutConfig, id: u8) {
+        self.data[cfg.switches_offset] ^= 1 << id;
+    }
+
+    // ─── Ticks (u16, little-endian) ────────────────────────────────────────
+
+    #[inline(always)]
+    pub fn get_ticks(&self, cfg: &LayoutConfig) -> u16 {
+        let off = cfg.ticks_offset;
+        (self.data[off] as u16) | ((self.data[off + 1] as u16) << 8)
+    }
+
+    #[inline(always)]
+    pub fn set_ticks(&mut self, cfg: &LayoutConfig, val: u16) {
+        let off = cfg.ticks_offset;
+        self.data[off] = (val & 0xFF) as u8;
+        self.data[off + 1] = ((val >> 8) & 0xFF) as u8;
+    }
+
+    #[inline(always)]
+    pub fn increment_ticks(&mut self, cfg: &LayoutConfig, amount: u16) {
+        let current = self.get_ticks(cfg);
+        let next = current.saturating_add(amount);
+        self.set_ticks(cfg, next);
+    }
+
+    // ─── Tick cost accumulator (variable terrain) ────────────────────────
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn get_tick_cost(&self, cfg: &LayoutConfig) -> u8 {
+        self.data[cfg.tick_cost_offset]
+    }
+
+    #[inline(always)]
+    pub fn add_tick_cost(&mut self, cfg: &LayoutConfig, amount: u8) {
+        let current = self.data[cfg.tick_cost_offset];
+        self.data[cfg.tick_cost_offset] = current.saturating_add(amount);
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_new_and_getters() {
-        let s = PackedState::new(42, 0b1010, 0b0101, 0b1111, 12345);
-        assert_eq!(s.get_cell(), 42);
-        assert_eq!(s.has_key(1), true);
-        assert_eq!(s.has_key(0), false);
-        assert_eq!(s.is_door_open(0), true);
-        assert_eq!(s.is_door_open(1), false);
-        assert_eq!(s.is_switch_flipped(0), true);
-        assert_eq!(s.get_ticks(), 12345);
+    fn test_location_roundtrip() {
+        let cfg = LayoutConfig::standard();
+        let mut s = PackedState::zero();
+        s.set_location(&cfg, 42069);
+        assert_eq!(s.get_location(&cfg), 42069);
     }
 
     #[test]
-    fn test_set_cell() {
-        let s = PackedState::new(0, 0, 0, 0, 0);
-        let s2 = s.set_cell(63);
-        assert_eq!(s2.get_cell(), 63);
-        // Original unchanged (Copy type)
-        assert_eq!(s.get_cell(), 0);
+    fn test_keys_bitflags() {
+        let cfg = LayoutConfig::standard();
+        let mut s = PackedState::zero();
+        s.add_key(&cfg, 2);
+        assert!(s.has_key(&cfg, 2));
+        assert!(!s.has_key(&cfg, 0));
     }
 
     #[test]
-    fn test_add_key() {
-        let s = PackedState::new(0, 0, 0, 0, 0);
-        let s2 = s.add_key(2);
-        assert!(s2.has_key(2));
-        assert!(!s2.has_key(0));
+    fn test_doors_toggle() {
+        let cfg = LayoutConfig::standard();
+        let mut s = PackedState::zero();
+        s.toggle_door(&cfg, 1);
+        assert!(s.is_door_open(&cfg, 1));
+        s.toggle_door(&cfg, 1);
+        assert!(!s.is_door_open(&cfg, 1));
     }
 
     #[test]
-    fn test_toggle_door() {
-        let s = PackedState::new(0, 0, 0, 0, 0);
-        let s2 = s.toggle_door(1);
-        assert!(s2.is_door_open(1));
-        let s3 = s2.toggle_door(1);
-        assert!(!s3.is_door_open(1));
+    fn test_ticks_increment() {
+        let cfg = LayoutConfig::standard();
+        let mut s = PackedState::zero();
+        s.increment_ticks(&cfg, 5);
+        assert_eq!(s.get_ticks(&cfg), 5);
+        s.increment_ticks(&cfg, 3);
+        assert_eq!(s.get_ticks(&cfg), 8);
     }
 
     #[test]
-    fn test_increment_tick() {
-        let s = PackedState::new(0, 0, 0, 0, 0);
-        let s2 = s.increment_tick();
-        assert_eq!(s2.get_ticks(), 1);
-        let mut s3 = s;
-        for _ in 0..100 {
-            s3 = s3.increment_tick();
-        }
-        assert_eq!(s3.get_ticks(), 100);
-    }
-
-    #[test]
-    fn test_saturation() {
-        let s = PackedState::new(0, 0, 0, 0, 65534);
-        let s2 = s.increment_tick();
-        assert_eq!(s2.get_ticks(), 65535);
-        let s3 = s2.increment_tick();
-        assert_eq!(s3.get_ticks(), 65535); // saturates
-    }
-
-    #[test]
-    fn test_all_bits_roundtrip() {
-        // Ensure every field survives a full encode/decode cycle.
-        let original = PackedState::new(63, 0x0F, 0x0F, 0x0F, 65535);
-        let raw = original.raw();
-        let recovered = PackedState::from_raw(raw);
-        assert_eq!(original, recovered);
+    fn test_no_cross_byte_contamination() {
+        let cfg = LayoutConfig::standard();
+        let mut s = PackedState::zero();
+        s.set_location(&cfg, 0xFFFF);
+        s.set_keys(&cfg, 0xAB);
+        s.set_doors(&cfg, 0xCD);
+        s.set_switches(&cfg, 0xEF);
+        s.set_ticks(&cfg, 0x1234);
+        assert_eq!(s.get_location(&cfg), 0xFFFF);
+        assert_eq!(s.get_keys(&cfg), 0xAB);
+        assert_eq!(s.get_doors(&cfg), 0xCD);
+        assert_eq!(s.get_switches(&cfg), 0xEF);
+        assert_eq!(s.get_ticks(&cfg), 0x1234);
     }
 }

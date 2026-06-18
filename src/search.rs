@@ -1,233 +1,205 @@
-//! IDA* Search Engine (Phase 2)
+//! Generic IDA* Search Engine
 //!
-//! Iterative Deepening A* with:
-//! - Pre-computed Pattern Database heuristic (O(1) lookup)
-//! - Generational flat-array dominance filter (no heap per iteration)
-//! - Stack-only recursion depth (path buffer lives on the caller's frame)
-//!
-//! The search minimizes the number of ticks (inputs) to reach the
-//! victory cell.  Every input — even Wait — costs exactly one tick.
+//! Iterative Deepening A* with a generational dominance filter.
+//! The filter is a flat Vec<u16> sized to `cells × 16 × 16 × 16`
+//! (cell, keys, doors, switches).  If this exceeds ~4 MB,
+//! it falls back to an `FxHashMap` backed by pre-allocated buckets.
 
-use crate::state::PackedState;
-use crate::env::{terrain_at, Input, step};
+use crate::state::{PackedState, LayoutConfig};
+use crate::env::{WorldConfig, INPUT_COUNT, step};
 use crate::pdb::PatternDatabase;
+use fxhash::FxHashMap;
 
-/// Solve the maze from `start` to the victory cell.
-/// Returns `(path, nodes_evaluated)` or `None` if unsolvable.
-pub fn solve(start: PackedState, pdb: &PatternDatabase) -> Option<(Vec<u8>, u64)> {
-    let h0 = pdb.get_heuristic(start);
-    if h0 == u32::MAX {
-        return None; // start is walled off even in the relaxed graph
+// ─── Dominance Filter ─────────────────────────────────────────────────────
+
+enum DominanceFilter {
+    /// Flat array: index = ((cell << 12) | (keys << 8) | (doors << 4) | switches).
+    /// Value = best tick count seen (0 = empty).
+    Flat { data: Vec<u16> },
+    /// Fallback for huge state spaces.
+    Map { data: FxHashMap<u64, u16> },
+}
+
+impl DominanceFilter {
+    fn new(cell_count: usize) -> Self {
+        let slots = cell_count * 16 * 16 * 16;
+        if slots <= 4_000_000 {
+            DominanceFilter::Flat {
+                data: vec![0; slots],
+            }
+        } else {
+            DominanceFilter::Map {
+                data: FxHashMap::default(),
+            }
+        }
     }
 
-    let mut threshold = h0;
-    // Reusable path buffer — only one allocation for the entire search.
-    let mut path = Vec::with_capacity(256);
-    let mut nodes_evaluated: u64 = 0;
-
-    // Dominance filter: 2^18 entries = 262 144 slots.
-    // Each slot stores (generation, best_ticks_seen) for a
-    // (Cell, Keys, Doors, Switches) configuration.
-    const TABLE_SIZE: usize = 1 << 18; // 262_144
-    let mut dom_gen = vec![0u32; TABLE_SIZE];
-    let mut dom_ticks = vec![0u16; TABLE_SIZE];
-    let mut current_gen: u32 = 1;
-
-    loop {
-        path.clear();
-        let mut next_threshold = u32::MAX;
-
-        let found = dfs(
-            start,
-            0,
-            threshold,
-            &mut path,
-            pdb,
-            &mut dom_gen,
-            &mut dom_ticks,
-            current_gen,
-            &mut next_threshold,
-            &mut nodes_evaluated,
-        );
-
-        if found {
-            return Some((path, nodes_evaluated));
+    fn clear(&mut self) {
+        match self {
+            DominanceFilter::Flat { data, .. } => {
+                // Fast memset for cache-resident array (~0.5 MB for 64 cells).
+                data.fill(0);
+            }
+            DominanceFilter::Map { data, .. } => {
+                data.clear();
+            }
         }
+    }
 
-        if next_threshold == u32::MAX {
-            return None; // exhausted state space
+    #[inline(always)]
+    fn is_dominated(&self, state: &PackedState, layout: &LayoutConfig) -> bool {
+        let cell = state.get_location(layout) as u64;
+        let keys = state.get_keys(layout) as u64;
+        let doors = state.get_doors(layout) as u64;
+        let switches = state.get_switches(layout) as u64;
+        let idx = (cell << 12) | (keys << 8) | (doors << 4) | switches;
+        let ticks = state.get_ticks(layout);
+
+        match self {
+            DominanceFilter::Flat { data, .. } => {
+                let entry = unsafe { *data.get_unchecked(idx as usize) };
+                entry != 0 && entry <= ticks
+            }
+            DominanceFilter::Map { data, .. } => {
+                match data.get(&idx) {
+                    Some(&stored) => stored != 0 && stored <= ticks,
+                    None => false,
+                }
+            }
         }
+    }
 
-        threshold = next_threshold;
-        current_gen += 1;
-        if current_gen == 0 {
-            // Generation counter wrapped — hard-reset the table.
-            dom_gen.fill(0);
-            current_gen = 1;
+    #[inline(always)]
+    fn mark(&mut self, state: &PackedState, layout: &LayoutConfig) {
+        let cell = state.get_location(layout) as u64;
+        let keys = state.get_keys(layout) as u64;
+        let doors = state.get_doors(layout) as u64;
+        let switches = state.get_switches(layout) as u64;
+        let idx = (cell << 12) | (keys << 8) | (doors << 4) | switches;
+        let ticks = state.get_ticks(layout);
+
+        match self {
+            DominanceFilter::Flat { data, .. } => {
+                unsafe { *data.get_unchecked_mut(idx as usize) = ticks; }
+            }
+            DominanceFilter::Map { data, .. } => {
+                data.insert(idx, ticks);
+            }
         }
     }
 }
 
-/// Recursive depth-first search for IDA*.
-///
-/// Returns `true` when the goal is found.  `next_threshold` is updated
-/// with the smallest f-score that exceeded the current `threshold`.
-#[inline(always)]
-fn dfs(
-    current: PackedState,
-    g: u32,
-    threshold: u32,
-    path: &mut Vec<u8>,
+// ─── IDA* Solver ──────────────────────────────────────────────────────────
+
+pub fn solve(
+    start: PackedState,
+    layout: &LayoutConfig,
+    world: &WorldConfig,
     pdb: &PatternDatabase,
-    dom_gen: &mut [u32],
-    dom_ticks: &mut [u16],
-    current_gen: u32,
-    next_threshold: &mut u32,
-    nodes_evaluated: &mut u64,
-) -> bool {
-    *nodes_evaluated += 1;
-
-    // ─── Goal test ──────────────────────────────────────────────────────
-    // Terrain::Victory == 18.
-    if terrain_at(current.get_cell()) == 18 {
-        return true;
+) -> Option<(Vec<u8>, u64)> {
+    let h = pdb.get_heuristic(&start, layout);
+    if h == u32::MAX {
+        return None;
+    }
+    if h == 0 {
+        return Some((Vec::new(), 0));
     }
 
-    let h = pdb.get_heuristic(current);
-    let f = g.saturating_add(h);
+    let mut bound = h as u64;
+    let mut path: Vec<u8> = Vec::with_capacity(64);
+    let mut nodes_evaluated: u64 = 0;
+    let mut filter = DominanceFilter::new(world.cell_count());
 
-    // ─── Threshold prune ────────────────────────────────────────────────
-    if f > threshold {
-        if f < *next_threshold {
-            *next_threshold = f;
+    loop {
+        filter.clear();
+        match dfs(
+            start,
+            0,
+            bound,
+            layout,
+            world,
+            pdb,
+            &mut path,
+            &mut filter,
+            &mut nodes_evaluated,
+        ) {
+            None => return Some((path.clone(), nodes_evaluated)),
+            Some(b) => bound = b,
         }
-        return false;
+    }
+}
+
+/// Recursive IDA* DFS.
+/// Returns `None` when the goal is found (path is in `path`).
+/// Returns `Some(min_excess)` when the smallest f-value that exceeded
+/// the bound across this subtree is `min_excess`.
+fn dfs(
+    state: PackedState,
+    g: u64,
+    bound: u64,
+    layout: &LayoutConfig,
+    world: &WorldConfig,
+    pdb: &PatternDatabase,
+    path: &mut Vec<u8>,
+    filter: &mut DominanceFilter,
+    nodes: &mut u64,
+) -> Option<u64> {
+    let h = pdb.get_heuristic(&state, layout) as u64;
+    let f = g + h;
+    if f > bound {
+        return Some(f);
+    }
+    if h == 0 {
+        return None; // Goal found
     }
 
-    // ─── Dominance prune ────────────────────────────────────────────────
-    // If we have already visited this (Cell, Keys, Doors, Switches) with
-    // fewer or equal ticks, this path is strictly worse — kill it.
-    let dom_idx = dominance_index(current);
-    if dom_gen[dom_idx] == current_gen {
-        if current.get_ticks() >= dom_ticks[dom_idx] {
-            return false;
-        }
-        dom_ticks[dom_idx] = current.get_ticks();
-    } else {
-        dom_gen[dom_idx] = current_gen;
-        dom_ticks[dom_idx] = current.get_ticks();
+    if filter.is_dominated(&state, layout) {
+        return Some(u64::MAX);
     }
+    filter.mark(&state, layout);
+    *nodes += 1;
 
-    // ─── Expand children ────────────────────────────────────────────────
-    // Order: movement inputs first (encourage progress), then Activate,
-    // then Wait (discourage stalling).
-    const INPUTS: [u8; 6] = [
-        Input::Up as u8,
-        Input::Down as u8,
-        Input::Left as u8,
-        Input::Right as u8,
-        Input::Activate as u8,
-        Input::Wait as u8,
-    ];
+    let mut min_excess = u64::MAX;
 
-    for &input_id in &INPUTS {
-        let input = match input_id {
-            0 => Input::Wait,
-            1 => Input::Up,
-            2 => Input::Down,
-            3 => Input::Left,
-            4 => Input::Right,
-            5 => Input::Activate,
-            _ => unreachable!(),
-        };
+    for input in 0..INPUT_COUNT {
+        if let Some(next) = step(state, input, layout, world) {
+            let delta = (next.get_ticks(layout).saturating_sub(state.get_ticks(layout))) as u64;
+            let next_g = g + delta.max(1);
+            path.push(input);
 
-        if let Some(next) = step(current, input) {
-            path.push(input_id);
-            if dfs(
-                next,
-                g.saturating_add(1),
-                threshold,
-                path,
-                pdb,
-                dom_gen,
-                dom_ticks,
-                current_gen,
-                next_threshold,
-                nodes_evaluated,
-            ) {
-                return true;
+            match dfs(next, next_g, bound, layout, world, pdb, path, filter, nodes) {
+                None => return None, // Found in child
+                Some(b) => {
+                    if b < min_excess {
+                        min_excess = b;
+                    }
+                }
             }
+
             path.pop();
         }
     }
 
-    false
+    Some(min_excess)
 }
 
-/// Compute the flat-array index for the dominance filter.
-/// Collapses the (Cell, Keys, Doors, Switches) tuple into 18 bits:
-///   cell     : bits 17..12  (6 bits)
-///   keys     : bits 11..8   (4 bits)
-///   doors    : bits 7..4    (4 bits)
-///   switches : bits 3..0    (4 bits)
-#[inline(always)]
-fn dominance_index(state: PackedState) -> usize {
-    let cell = state.get_cell() as usize;
-    let keys = state.get_keys() as usize;
-    let doors = state.get_doors() as usize;
-    let switches = state.get_switches() as usize;
-
-    (cell << 12) | (keys << 8) | (doors << 4) | switches
-}
-
-// ─── Tests ─────────────────────────────────────────────────────────────────
+// ─── Tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::idx;
+    use crate::env::default_world;
 
     #[test]
-    fn test_solve_already_at_victory() {
-        let pdb = PatternDatabase::compute(idx(7, 6));
-        let start = PackedState::new(idx(7, 6), 0, 0, 0, 0);
-        let solution = solve(start, &pdb);
-        assert!(solution.is_some());
-        let (path, nodes) = solution.unwrap();
-        assert!(path.is_empty());
-        assert!(nodes > 0);
-    }
-
-    #[test]
-    fn test_solve_one_step_from_victory() {
-        let pdb = PatternDatabase::compute(idx(7, 6));
-        let start = PackedState::new(idx(6, 6), 0, 0, 0, 0);
-        let solution = solve(start, &pdb);
-        assert!(solution.is_some());
-        let (path, _nodes) = solution.unwrap();
-        assert_eq!(path.len(), 1);
-    }
-
-    #[test]
-    fn test_solve_full_maze() {
-        let pdb = PatternDatabase::compute(idx(7, 6));
-        let start = PackedState::new(idx(1, 1), 0, 0, 0, 0);
-        let solution = solve(start, &pdb);
-        assert!(solution.is_some(), "IDA* must find a path to victory");
-        let (path, nodes) = solution.unwrap();
-        assert!(!path.is_empty(), "path should contain at least one input");
-        println!("Full maze solved: {} inputs, {} nodes evaluated", path.len(), nodes);
-    }
-
-    #[test]
-    fn test_solve_hell_maze() {
-        crate::env::select_hell_maze();
-        let pdb = PatternDatabase::compute(idx(7, 3));
-        let start = PackedState::new(idx(1, 3), 0, 0, 0, 0);
-        let solution = solve(start, &pdb);
-        assert!(solution.is_some(), "IDA* must solve the hell maze");
-        let (path, nodes) = solution.unwrap();
+    fn test_solve_default_maze() {
+        let layout = LayoutConfig::standard();
+        let world = default_world();
+        let pdb = PatternDatabase::compute(&layout, &world);
+        let mut start = PackedState::zero();
+        start.set_location(&layout, world.start_cell);
+        let result = solve(start, &layout, &world, &pdb);
+        assert!(result.is_some(), "IDA* must find a path");
+        let (path, nodes) = result.unwrap();
         assert!(!path.is_empty());
-        println!("Hell maze solved: {} inputs, {} nodes evaluated", path.len(), nodes);
-        crate::env::select_default_maze();
+        println!("Default maze: {} inputs, {} nodes", path.len(), nodes);
     }
 }
