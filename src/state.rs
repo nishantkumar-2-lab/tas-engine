@@ -186,6 +186,45 @@ impl PackedState {
         let current = self.data[cfg.tick_cost_offset];
         self.data[cfg.tick_cost_offset] = current.saturating_add(amount);
     }
+
+    // ─── Floating-Point (f32) Coordinate Mapping ──────────────────────────
+    /// Reads 4 bytes at `offset` as a little-endian f32.
+    /// Zero bytes decode to 0.0.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn get_f32(&self, offset: usize) -> f32 {
+        let bytes = [self.data[offset], self.data[offset + 1],
+                     self.data[offset + 2], self.data[offset + 3]];
+        f32::from_le_bytes(bytes)
+    }
+
+    /// Writes a little-endian f32 into 4 bytes at `offset`.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn set_f32(&mut self, offset: usize, val: f32) {
+        let bytes = val.to_le_bytes();
+        self.data[offset..offset + 4].copy_from_slice(&bytes);
+    }
+
+    /// Reads 4 bytes at `offset` as a little-endian u32.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn get_u32(&self, offset: usize) -> u32 {
+        (self.data[offset] as u32)
+            | ((self.data[offset + 1] as u32) << 8)
+            | ((self.data[offset + 2] as u32) << 16)
+            | ((self.data[offset + 3] as u32) << 24)
+    }
+
+    /// Writes a little-endian u32 into 4 bytes at `offset`.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn set_u32(&mut self, offset: usize, val: u32) {
+        self.data[offset] = (val & 0xFF) as u8;
+        self.data[offset + 1] = ((val >> 8) & 0xFF) as u8;
+        self.data[offset + 2] = ((val >> 16) & 0xFF) as u8;
+        self.data[offset + 3] = ((val >> 24) & 0xFF) as u8;
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -244,5 +283,19 @@ mod tests {
         assert_eq!(s.get_doors(&cfg), 0xCD);
         assert_eq!(s.get_switches(&cfg), 0xEF);
         assert_eq!(s.get_ticks(&cfg), 0x1234);
+    }
+
+    #[test]
+    fn test_f32_roundtrip() {
+        let mut s = PackedState::zero();
+        s.set_f32(0, 3.14159);
+        assert!((s.get_f32(0) - 3.14159).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_u32_roundtrip() {
+        let mut s = PackedState::zero();
+        s.set_u32(4, 0xDEADBEEF);
+        assert_eq!(s.get_u32(4), 0xDEADBEEF);
     }
 }

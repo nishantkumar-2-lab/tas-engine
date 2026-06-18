@@ -89,6 +89,47 @@ impl TASDriver {
         JitterReport { max_ns, min_ns, avg_ns, samples }
     }
 
+    /// Inject inputs synchronized to an external frame counter.
+    /// Spins until `poll_counter()` returns a value > last_frame,
+    /// then fires the next input immediately.
+    /// This achieves single-cycle alignment with the target software.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn run_memory_sync_injection<F, P>(&self, mut inject: F, mut poll_counter: P) -> JitterReport
+    where
+        F: FnMut(u8),
+        P: FnMut() -> u64,
+    {
+        if self.frames.is_empty() { return JitterReport::default(); }
+        let epoch = Instant::now();
+        let mut max_ns = i64::MIN;
+        let mut min_ns = i64::MAX;
+        let mut sum_ns: i64 = 0;
+        let mut samples = 0u64;
+        let mut last_frame = poll_counter();
+
+        for frame in &self.frames {
+            // Spin-lock until the target increments its frame counter.
+            loop {
+                let current = poll_counter();
+                if current > last_frame {
+                    last_frame = current;
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            let fire = Instant::now();
+            inject(frame.input_id);
+            let jitter = fire.duration_since(epoch).as_nanos() as i64 - frame.target_ns as i64;
+            max_ns = max_ns.max(jitter);
+            min_ns = min_ns.min(jitter);
+            sum_ns = sum_ns.wrapping_add(jitter);
+            samples += 1;
+        }
+        let avg_ns = if samples > 0 { (sum_ns as f64) / (samples as f64) } else { 0.0 };
+        JitterReport { max_ns, min_ns, avg_ns, samples }
+    }
+
     #[allow(dead_code)]
     pub fn export_to_tas_file(&self, path: &str, frame_rate_hz: u64) -> IoResult<()> {
         let mut file = File::create(path)?;

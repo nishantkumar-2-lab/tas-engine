@@ -183,6 +183,92 @@ fn dfs(
     Some(min_excess)
 }
 
+// ─── Rolling-Horizon Re-Planner ───────────────────────────────────────────
+
+/// Configuration for real-time rolling-horizon search.
+/// Used when the environment contains non-determinism (RNG, external actors).
+pub struct RollingHorizonConfig {
+    /// Maximum depth (in inputs) for each shallow solve.
+    pub lookahead_depth: usize,
+    /// Maximum total nodes evaluated per micro-replan.
+    pub node_budget: u64,
+}
+
+impl Default for RollingHorizonConfig {
+    fn default() -> Self {
+        RollingHorizonConfig {
+            lookahead_depth: 6,
+            node_budget: 50_000,
+        }
+    }
+}
+
+/// Plans a short input sequence from `start` using greedy depth-limited search.
+/// At each step, picks the input that yields the lowest PDB heuristic.
+/// Returns the partial path and node count.
+pub fn plan_sequence(
+    start: PackedState,
+    layout: &LayoutConfig,
+    world: &WorldConfig,
+    pdb: &PatternDatabase,
+    cfg: &RollingHorizonConfig,
+) -> Option<(Vec<u8>, u64)> {
+    let mut state = start;
+    let mut path: Vec<u8> = Vec::with_capacity(cfg.lookahead_depth);
+    let mut nodes: u64 = 0;
+
+    for _ in 0..cfg.lookahead_depth {
+        let h = pdb.get_heuristic(&state, layout);
+        if h == 0 { break; }
+        if h == u32::MAX { return None; }
+
+        let mut best_input: Option<u8> = None;
+        let mut best_h: u32 = u32::MAX;
+
+        for input in 0..INPUT_COUNT {
+            if let Some(next) = step(state, input, layout, world) {
+                nodes += 1;
+                let nh = pdb.get_heuristic(&next, layout);
+                if nh < best_h {
+                    best_h = nh;
+                    best_input = Some(input);
+                }
+            }
+        }
+
+        if nodes > cfg.node_budget {
+            break;
+        }
+
+        match best_input {
+            Some(input) => {
+                state = step(state, input, layout, world).unwrap();
+                path.push(input);
+            }
+            None => break,
+        }
+    }
+
+    Some((path, nodes))
+}
+
+/// Replays `inputs` from `start` and returns the expected state.
+/// Used to detect divergence against a live `StateProvider`.
+#[allow(dead_code)]
+pub fn replay_path(
+    mut state: PackedState,
+    inputs: &[u8],
+    layout: &LayoutConfig,
+    world: &WorldConfig,
+) -> PackedState {
+    for &input in inputs {
+        if let Some(next) = step(state, input, layout, world) {
+            state = next;
+        }
+    }
+    state
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -201,5 +287,33 @@ mod tests {
         let (path, nodes) = result.unwrap();
         assert!(!path.is_empty());
         println!("Default maze: {} inputs, {} nodes", path.len(), nodes);
+    }
+
+    #[test]
+    fn test_rolling_horizon_shallow() {
+        let layout = LayoutConfig::standard();
+        let world = default_world();
+        let pdb = PatternDatabase::compute(&layout, &world);
+        let mut start = PackedState::zero();
+        start.set_location(&layout, world.start_cell);
+        let rh = RollingHorizonConfig { lookahead_depth: 3, node_budget: 10_000 };
+        let result = plan_sequence(start, &layout, &world, &pdb, &rh);
+        assert!(result.is_some());
+        let (path, nodes) = result.unwrap();
+        assert!(!path.is_empty());
+        assert!(path.len() <= 3 || nodes > 0);
+        println!("Rolling horizon: {} inputs, {} nodes", path.len(), nodes);
+    }
+
+    #[test]
+    fn test_replay_path_matches() {
+        let layout = LayoutConfig::standard();
+        let world = default_world();
+        let pdb = PatternDatabase::compute(&layout, &world);
+        let mut start = PackedState::zero();
+        start.set_location(&layout, world.start_cell);
+        let (path, _) = solve(start, &layout, &world, &pdb).unwrap();
+        let expected = replay_path(start, &path, &layout, &world);
+        assert_eq!(expected.get_location(&layout), world.victory_cell);
     }
 }
